@@ -53,19 +53,24 @@ import androidx.compose.ui.unit.dp
 import androidx.wear.compose.material.Icon // WEAR Icon
 import androidx.wear.compose.material.MaterialTheme // WEAR MaterialTheme
 import androidx.wear.compose.material.Text     // WEAR Text
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Box
 
 //Material Icons (heart icon vector)
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.ui.input.key.type
 import androidx.core.content.ContextCompat
+import androidx.compose.ui.viewinterop.AndroidView
 
 //project imports
-import com.fyp.safesyncwatch.presentation.theme.SafeSyncWatchTheme
+import com.fyp.safesyncwatch.theme.PulseHeartView
+import com.fyp.safesyncwatch.theme.SafeSyncWatchTheme
 
 //Google Play Services for Wearable Data Layer
 import com.google.android.gms.wearable.PutDataMapRequest
 import com.google.android.gms.wearable.Wearable
+
 
 class MainActivity : ComponentActivity(), SensorEventListener {
 
@@ -225,55 +230,55 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 }
 // --- End of MainActivity ---
 
+@Composable
+fun PulseHeartViewCompose() {
+    AndroidView(
+        factory = { context -> PulseHeartView(context) },
+        modifier = Modifier.size(72.dp)
+    )
+}
 
 @Composable
 fun WearApp(bpm: Int, permissionGranted: Boolean) {
-    Column(
-        modifier = Modifier.fillMaxSize(),
-        verticalArrangement = Arrangement.Center,
-        horizontalAlignment = Alignment.CenterHorizontally
-    ) {
-        val infiniteTransition = rememberInfiniteTransition(label = "heart_beat_transition")
-        val scale by infiniteTransition.animateFloat(
-            initialValue = 1f,
-            targetValue = 1.3f,
-            animationSpec = infiniteRepeatable(
-                animation = tween(durationMillis = 600, easing = FastOutSlowInEasing),
-                repeatMode = RepeatMode.Reverse
-            ), label = "heart_beat_scale_animation"
-        )
+        Column(
+            modifier = Modifier.fillMaxSize(),
+            verticalArrangement = Arrangement.Center,
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            val infiniteTransition = rememberInfiniteTransition(label = "heart_beat_transition")
+            val scale by infiniteTransition.animateFloat(
+                initialValue = 1f,
+                targetValue = 1.3f,
+                animationSpec = infiniteRepeatable(
+                    animation = tween(durationMillis = 600, easing = FastOutSlowInEasing),
+                    repeatMode = RepeatMode.Reverse
+                ), label = "heart_beat_scale_animation"
+            )
 
-        Icon(
-            imageVector = Icons.Filled.Favorite,
-            contentDescription = "Beating Heart Icon",
-            modifier = Modifier
-                .size(72.dp)
-                .scale(scale),
-            tint = if (bpm > 0 && permissionGranted) Color.Red else Color.Gray
-        )
+            PulseHeartViewCompose()
 
-        Spacer(modifier = Modifier.height(16.dp))
+            Spacer(modifier = Modifier.height(16.dp))
 
-        // --- Display Text ---
-        val displayText = when {
-            !permissionGranted && bpm == -1 -> "Permission Denied"
-            bpm == -2 -> "Sensor N/A"
-            bpm == 0 && permissionGranted && bpm != -1 && bpm != -2 -> "BPM: ..."
-            bpm == 0 && !permissionGranted -> "Requesting Permission..."
-            bpm > 0 && permissionGranted -> "$bpm BPM"
-            else -> "BPM: --"
-        }
-
-        Text(
-            text = displayText,
-            style = MaterialTheme.typography.title1,
-            color = if (bpm > 0 && permissionGranted) { //Conditional Color
-                Color.Black
-            } else if (!permissionGranted && bpm == -1) {
-                Color.Red // Different color for "Permission Denied"
-            } else {
-                Color.LightGray // Default color for other states like ... and wtv
+            //Display Text
+            val displayText = when {
+                !permissionGranted && bpm == -1 -> "Permission Denied"
+                bpm == -2 -> "Sensor N/A"
+                bpm == 0 && permissionGranted && bpm != -1 && bpm != -2 -> "... BpM"
+                bpm == 0 && !permissionGranted -> "Requesting Permission..."
+                bpm > 0 && permissionGranted -> "$bpm BpM"
+                else -> "-- BpM"
             }
-        )
-    }
+
+            Text(
+                text = displayText,
+                style = MaterialTheme.typography.title1,
+                color = if (bpm > 0 && permissionGranted) { //Conditional Color
+                    Color.Black
+                } else if (!permissionGranted && bpm == -1) {
+                    Color.Red // Different color for "Permission Denied"
+                } else {
+                    Color.LightGray // Default color for other states like ... and wtv
+                }
+            )
+        }
 }

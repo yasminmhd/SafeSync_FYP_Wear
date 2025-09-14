@@ -1,4 +1,4 @@
-package com.fyp.safesyncwatch.presentation.theme
+package com.fyp.safesyncwatch.theme
 
 import androidx.compose.runtime.Composable
 import androidx.wear.compose.material.MaterialTheme
