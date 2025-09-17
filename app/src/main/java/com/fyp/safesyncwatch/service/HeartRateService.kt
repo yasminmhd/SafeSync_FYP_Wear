@@ -20,6 +20,7 @@ import android.content.BroadcastReceiver
 import android.content.IntentFilter
 
 class HeartRateService : Service(), SensorEventListener {
+    private var wakeLock: android.os.PowerManager.WakeLock? = null
     private lateinit var sensorManager: SensorManager
     private var heartRateSensor: Sensor? = null
 
@@ -41,19 +42,34 @@ class HeartRateService : Service(), SensorEventListener {
 
     override fun onCreate() {
         super.onCreate()
+        android.util.Log.d("HR_SERVICE", "onCreate")
+
+        // optional wakelock
+        val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+        wakeLock = pm.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "SafeSync:HR").apply { acquire() }
+
         registerReceiver(batteryReceiver, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
         heartRateSensor = sensorManager.getDefaultSensor(Sensor.TYPE_HEART_RATE)
-        heartRateSensor?.let {
-            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL)
-        }
+
         startForeground(1, createNotification())
+        android.util.Log.d("HR_SERVICE", "startForeground done")
+
+        heartRateSensor?.let {
+            val ok = sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL)
+            android.util.Log.d("HR_SERVICE", "registerListener=$ok sensor=${it.name}")
+        } ?: run {
+            android.util.Log.e("HR_SERVICE", "No heart rate sensor!")
+        }
     }
 
     override fun onDestroy() {
-        super.onDestroy()
+        android.util.Log.d("HR_SERVICE", "onDestroy")
         unregisterReceiver(batteryReceiver)
         sensorManager.unregisterListener(this)
+        wakeLock?.release()
+        wakeLock = null
+        super.onDestroy()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -61,6 +77,8 @@ class HeartRateService : Service(), SensorEventListener {
     override fun onSensorChanged(event: SensorEvent?) {
         if (event?.sensor?.type == Sensor.TYPE_HEART_RATE) {
             val bpm = event.values[0].toInt()
+            android.util.Log.d("HR_SERVICE", "HR event: $bpm")
+            android.util.Log.d("HR_WATCH", "HR event in bg: $bpm @${System.currentTimeMillis()}")
             if (bpm > 0) {
                 sendHeartRateToPhone(bpm)
                 broadcastHeartRate(bpm)

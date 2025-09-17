@@ -40,15 +40,26 @@ android {
 }
 
 dependencies {
-    implementation("androidx.wear:wear:1.2.0")
-    implementation("com.google.android.gms:play-services-wearable:18.1.0")
-    implementation("androidx.compose.material:material-icons-core:1.6.8")
-    implementation("androidx.compose.material:material-icons-extended:1.6.8")
-    implementation("androidx.core:core-ktx:1.12.0")
-    implementation("androidx.appcompat:appcompat:1.6.1")
-    implementation("com.google.android.support:wearable:2.9.0")
-    compileOnly("com.google.android.wearable:wearable:2.9.0")
-    implementation(libs.play.services.wearable)
+    // Core Wear OS
+    implementation(libs.wear)
+    implementation(libs.play.services.wearable.v1820)
+
+    implementation("androidx.wear.compose:compose-material:1.2.1")
+    implementation("androidx.wear.compose:compose-foundation:1.2.1")
+    implementation("androidx.wear.compose:compose-navigation:1.2.1")
+    implementation("androidx.navigation:navigation-compose:2.7.7")
+    implementation("com.google.android.gms:play-services-maps:18.2.0")
+
+    implementation(libs.material.icons.core)
+    implementation(libs.material.icons.extended)
+
+    implementation(libs.core.ktx)
+    implementation(libs.appcompat)
+
+    implementation(libs.wearable)
+    implementation(libs.material3.android)
+    compileOnly(libs.google.wearable)
+
     implementation(platform(libs.compose.bom))
     implementation(libs.ui)
     implementation(libs.ui.graphics)

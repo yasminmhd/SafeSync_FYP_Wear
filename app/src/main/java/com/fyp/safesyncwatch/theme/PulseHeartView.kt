@@ -15,7 +15,7 @@ class PulseHeartView @JvmOverloads constructor(
     context: Context, attrs: AttributeSet? = null
 ) : View(context, attrs) {
 
-    private val pulseColor = Color.RED
+    private val pulseColor = Color.parseColor("#F26060")
     private val iconColor = Color.WHITE
     private val pulseCount = 3
     private val innerSize = 80f
