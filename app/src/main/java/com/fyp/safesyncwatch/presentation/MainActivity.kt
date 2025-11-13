@@ -57,6 +57,7 @@ import com.google.android.gms.wearable.PutDataMapRequest
 import com.google.android.gms.wearable.Wearable
 import java.util.concurrent.TimeUnit
 import java.time.*
+import androidx.compose.material3.Surface
 
 fun startOfTodayMillis(): Long {
     val zone = ZoneId.systemDefault()
@@ -74,11 +75,25 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var heartRateBpm by mutableStateOf(0)
     private var sensorPermissionGranted by mutableStateOf(false)
     private val TAG = "HeartRate"
-    private val heartRateHistory = mutableStateListOf<HeartRateEntry>() // Use mutableStateListOf for Compose recomposition
+    private val heartRateHistory = mutableStateListOf<HeartRateEntry>()
     private val handler = Handler(Looper.getMainLooper())
     private var showDetachedDialog by mutableStateOf(false)
     private val bpmTimeoutMs = 30_000L // 30 seconds
     private var lastValidBpmTime by mutableStateOf(0L) // Keep track of the last valid BPM time
+    private var emergencyActivated by mutableStateOf(false)
+    private var emergencyDismissedAt by mutableStateOf(0L) // avoid immediate re-trigger
+
+    private val requestBackgroundPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted: Boolean ->
+            if (isGranted) {
+                android.util.Log.d(TAG, "BODY_SENSORS_BACKGROUND granted.")
+                startHrService()
+            } else {
+                android.util.Log.e(TAG, "BODY_SENSORS_BACKGROUND denied.")
+                // still attempt to start the service on older devices; for API 34+ it's required to have bg permission
+                if (android.os.Build.VERSION.SDK_INT < 34) startHrService()
+            }
+        }
 
     private val requestPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted: Boolean ->
@@ -87,13 +102,10 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 sensorPermissionGranted = true
                 initializeAndRegisterSensor()
 
+                // Request background sensors permission explicitly on Android 34+
                 if (android.os.Build.VERSION.SDK_INT >= 34) {
-                    registerForActivityResult(
-                        ActivityResultContracts.RequestPermission()
-                    ) { bgGranted ->
-                        if (bgGranted) startHrService()
-                        else Log.e(TAG, "BODY_SENSORS_BACKGROUND denied")
-                    }.launch(Manifest.permission.BODY_SENSORS_BACKGROUND)
+                    // launch the background permission flow
+                    requestBackgroundPermissionLauncher.launch(Manifest.permission.BODY_SENSORS_BACKGROUND)
                 } else {
                     startHrService()
                 }
@@ -112,13 +124,22 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         setContent {
             SafeSyncWatchTheme {
                 if (!sensorPermissionGranted) { RequestHeartRatePermission() }
-                // Show the menu + navigate to Heartbeat screen
                 WearRoot(
                     heartRateList = heartRateHistory.toList(),
                     latestBpm = heartRateBpm,
                     permissionGranted = sensorPermissionGranted
                 )
                 SensorLifecycleEffect()
+
+                // Emergency overlay
+                if (emergencyActivated) {
+                    EmergencyAlert(
+                        onCancel = {
+                            emergencyActivated = false
+                            emergencyDismissedAt = System.currentTimeMillis()
+                        }
+                    )
+                }
             }
         }
     }
@@ -219,12 +240,14 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         if (event?.sensor?.type == Sensor.TYPE_HEART_RATE) {
             val bpm = event.values[0].toInt()
             val currentTime = System.currentTimeMillis()
-            Log.d(TAG, "onSensorChanged: Received BPM: $bpm at $currentTime")
             if (bpm > 0) {
                 heartRateBpm = bpm
+                // trigger emergency overlay if above threshold and not recently dismissed
+                if (bpm > 90 && !emergencyActivated && currentTime - emergencyDismissedAt > TimeUnit.SECONDS.toMillis(30)) {
+                    emergencyActivated = true
+                }
                 if (heartRateHistory.isEmpty() || heartRateHistory.last().bpm != bpm) {
                     heartRateHistory.add(HeartRateEntry(currentTime, bpm))
-                    // Keep history within a reasonable limit
                     pruneOldHeartRateHistory(System.currentTimeMillis() - TimeUnit.HOURS.toMillis(48))
                     saveHeartRateHistory()
                 }
@@ -233,7 +256,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 handler.removeCallbacks(bpmTimeoutRunnable)
                 handler.postDelayed(bpmTimeoutRunnable, bpmTimeoutMs)
             } else if (bpm == 0 && heartRateBpm > 0) {
-                Log.d(TAG, "Sensor reported BPM 0, starting timeout.")
                 handler.removeCallbacks(bpmTimeoutRunnable)
                 handler.postDelayed(bpmTimeoutRunnable, bpmTimeoutMs)
             }
@@ -430,7 +452,11 @@ fun HeartbeatScreen(bpm: Int, permissionGranted: Boolean) {
         Text(
             text = displayText,
             style = MaterialTheme.typography.title1,
-            color = if (bpm > 0 && permissionGranted) Color.Black else Color.LightGray
+            color = when {
+                bpm > 90 && permissionGranted -> Color.Red
+                bpm > 0 && permissionGranted -> Color.Black
+                else -> Color.LightGray
+            }
         )
     }
 }
@@ -462,18 +488,17 @@ fun HeartRateTimeChart(heartRateData: List<HeartRateEntry>) {
     val chartWidthDp = LocalConfiguration.current.screenWidthDp.dp - 32.dp
 
     val now = System.currentTimeMillis()
-    val todayStart = startOfTodayMillis()
-    val todayEnd = todayStart + TimeUnit.DAYS.toMillis(1)
-    val windowEnd = minOf(now, todayEnd)
-    val durationMs = todayEnd - todayStart
+    val windowEnd = now
+    val windowStart = now - TimeUnit.HOURS.toMillis(1) // last hour
+    val durationMs = (windowEnd - windowStart).coerceAtLeast(1L)
 
-    val binMs = TimeUnit.MINUTES.toMillis(10)
+    val binMs = TimeUnit.MINUTES.toMillis(5) // 5-minute bins for last hour
 
     val relevant = remember(heartRateData, now) {
-        heartRateData.filter { it.timestamp in todayStart..windowEnd }
+        heartRateData.filter { it.timestamp in windowStart..windowEnd }
     }
     val binned = remember(relevant, now) {
-        binHeartRate(relevant, todayStart, windowEnd, binMs)
+        binHeartRate(relevant, windowStart, windowEnd, binMs)
     }
 
     if (binned.isEmpty()) {
@@ -484,7 +509,7 @@ fun HeartRateTimeChart(heartRateData: List<HeartRateEntry>) {
                 .padding(8.dp)
                 .background(Color.DarkGray.copy(alpha = 0.1f)),
             contentAlignment = Alignment.Center
-        ) { Text("No data today", color = Color.LightGray) }
+        ) { Text("No data in last hour", color = Color.LightGray) }
         return
     }
 
@@ -503,16 +528,15 @@ fun HeartRateTimeChart(heartRateData: List<HeartRateEntry>) {
     ) {
         Canvas(modifier = Modifier.matchParentSize()) {
             val bottomPad = 36.dp.toPx()
-            val leftPad = 25.dp.toPx()
-            val topPad = 35.dp.toPx()
-            val rightPad  = 24.dp.toPx()
+            val leftPad = 35.dp.toPx()
+            val topPad = 50.dp.toPx()
+            val rightPad  = 14.dp.toPx()
 
             val graphH = size.height - bottomPad - topPad
             val graphW = size.width - leftPad - rightPad
 
             fun xAt(t: Long): Float {
-                //relative to start of today
-                val f = (t - todayStart).toFloat() / durationMs.toFloat()
+                val f = (t - windowStart).toFloat() / durationMs.toFloat()
                 return leftPad + (f * graphW).coerceIn(0f, graphW)
             }
             fun yAt(bpm: Float): Float {
@@ -570,25 +594,27 @@ fun HeartRateTimeChart(heartRateData: List<HeartRateEntry>) {
                     c.nativeCanvas.drawText(v.toInt().toString(), leftPad - 10f, y + (paint.textSize * 0.35f), paint)
                 }
                 val labelPaint = android.graphics.Paint(paint).apply { textAlign = android.graphics.Paint.Align.CENTER }
-                c.nativeCanvas.drawText("BPM", leftPad - 30f, topPad -0f, labelPaint)
+                c.nativeCanvas.drawText("BPM", leftPad - 30f, topPad - 18f, labelPaint)
             }
 
-            //X at 0,6,12,18,24 hours from today
+            // X ticks for last hour at 0,15,30,45,60 minutes
             drawIntoCanvas { c ->
                 val paint = android.graphics.Paint().apply {
                     color = android.graphics.Color.BLACK
-                    textSize = 18f
+                    textSize = 16f
                     textAlign = android.graphics.Paint.Align.CENTER
                     isAntiAlias = true
                 }
-                intArrayOf(0, 6, 12, 18, 24).forEach { h ->
-                    val t = todayStart + TimeUnit.HOURS.toMillis(h.toLong())
+                intArrayOf(60, 45, 30, 15, 0).forEach { labelMinutes ->
+                    val offsetMin = (60 - labelMinutes).toLong()
+                    val t = windowStart + TimeUnit.MINUTES.toMillis(offsetMin)
                     val x = xAt(t)
                     drawLine(Color.Gray, Offset(x, topPad + graphH), Offset(x, topPad + graphH + 6f), 2f)
-                    c.nativeCanvas.drawText(h.toString(), x, topPad + graphH + 22f, paint)
+                    val text = "${labelMinutes}m"
+                    c.nativeCanvas.drawText(text, x, topPad + graphH + 22f, paint)
                 }
                 val labelPaint = android.graphics.Paint(paint)
-                c.nativeCanvas.drawText("Hours (today)", leftPad + graphW / 2f, topPad + graphH + 42f, labelPaint)
+                c.nativeCanvas.drawText("Minutes ago (last hour)", leftPad + graphW / 2f, topPad + graphH + 42f, labelPaint)
             }
 
             drawPath(line, color = Color.Red, style = Stroke(width = 3f))
@@ -597,58 +623,47 @@ fun HeartRateTimeChart(heartRateData: List<HeartRateEntry>) {
 }
 
 @Composable
-fun WearApp(bpm: Int, permissionGranted: Boolean, heartRateList: List<HeartRateEntry>) {
-    Column(
+fun EmergencyAlert(onCancel: () -> Unit) {
+    // Fullscreen semi-transparent overlay with a centered card and a Cancel button
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0x88000000)),
+        contentAlignment = Alignment.Center
+    ) {
+        Surface(
             modifier = Modifier
-                .fillMaxSize()
-                .background(Color.White)
-                .verticalScroll(rememberScrollState()),
-            verticalArrangement = Arrangement.Center,
-            horizontalAlignment = Alignment.CenterHorizontally
+                .padding(20.dp)
+                .fillMaxWidth()
+                .wrapContentHeight(),
+            color = Color.White,
+            shape = androidx.compose.foundation.shape.RoundedCornerShape(8.dp),
+            shadowElevation = 8.dp
         ) {
-            val infiniteTransition = rememberInfiniteTransition(label = "heart_beat_transition")
-            val scale by infiniteTransition.animateFloat(
-                initialValue = 1f,
-                targetValue = 1.3f,
-                animationSpec = infiniteRepeatable(
-                    animation = tween(durationMillis = 600, easing = FastOutSlowInEasing),
-                    repeatMode = RepeatMode.Reverse
-                ), label = "heart_beat_scale_animation"
-            )
-
-            Spacer(modifier = Modifier.height(32.dp))
-
-            PulseHeartViewCompose()
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            //Display Text
-            val displayText = when {
-                !permissionGranted && bpm == -1 -> "Permission Denied"
-                bpm == -2 -> "Sensor N/A"
-                bpm == 0 && permissionGranted && bpm != -1 && bpm != -2 -> "... BpM"
-                bpm == 0 && !permissionGranted -> "Requesting Permission..."
-                bpm > 0 && permissionGranted -> "$bpm BpM"
-                else -> "-- BpM"
-            }
-
-            Text(
-                text = displayText,
-                style = MaterialTheme.typography.title1,
-                color = if (bpm > 0 && permissionGranted) { //Conditional Color
-                    Color.White
-                } else if (!permissionGranted && bpm == -1) {
-                    Color.Red // Different color for "Permission Denied"
-                } else {
-                    Color.LightGray // Default color for other states like ... and wtv
+            Column(
+                modifier = Modifier
+                    .padding(12.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Text("Emergency activated", style = MaterialTheme.typography.title2, color = Color(0xFFB00020))
+                Text("High heart rate detected. Tap Cancel to dismiss.", style = MaterialTheme.typography.body2, color = Color.Black)
+                Row(
+                    horizontalArrangement = Arrangement.Center,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    androidx.wear.compose.material.Button(
+                        onClick = onCancel,
+                        modifier = Modifier.size(width = 110.dp, height = 40.dp),
+                        colors = androidx.wear.compose.material.ButtonDefaults.primaryButtonColors(
+                            backgroundColor = Color.LightGray,
+                            contentColor = Color.Black
+                        )
+                    ) {
+                        Text("Cancel")
+                    }
                 }
-            )
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            HeartRateTimeChart(heartRateList)
-
-            Spacer(modifier = Modifier.height(32.dp))
-
+            }
         }
+    }
 }

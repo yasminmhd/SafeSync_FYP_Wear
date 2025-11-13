@@ -30,6 +30,9 @@ import androidx.wear.compose.material.TimeText
 import com.fyp.safesyncwatch.R
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.runtime.CompositionLocalProvider
+
+
 
 
 sealed class Screen(val route: String) {
@@ -83,13 +86,17 @@ fun HomeHub(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.White),
-        timeText = { TimeText() },
+        timeText = {
+            CompositionLocalProvider(LocalContentColor provides Color.Black) {
+                TimeText()
+            }
+        },
     ) {
         Column(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(horizontal = 8.dp)
-                .padding(bottom = 12.dp, top = 6.dp),
+                .padding(bottom = 12.dp, top = 5.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(10.dp, Alignment.CenterVertically)
         ) {
@@ -118,13 +125,8 @@ fun HomeHub(
                 Surface(
                     modifier = Modifier
                         .width(62.dp)
-                        .height(108.dp)
-                        .clip(
-                            RoundedCornerShape(
-                                topStart = 28.dp, topEnd = 28.dp,
-                                bottomEnd = 28.dp, bottomStart = 40.dp
-                            )
-                        )
+                        .height(75.dp)
+                        .clip(RoundedCornerShape(30.dp))
                         .clickable(onClick = onHeartbeat),
                     color = Side
                 ) {
@@ -142,7 +144,7 @@ fun HomeHub(
                 Surface(
                     modifier = Modifier
                         .width(62.dp)
-                        .height(108.dp)
+                        .height(75.dp)
                         .clip(RoundedCornerShape(30.dp))
                         .clickable(onClick = onEmergency),
                     color = Mid,
@@ -162,13 +164,8 @@ fun HomeHub(
                 Surface(
                     modifier = Modifier
                         .width(62.dp)
-                        .height(108.dp)
-                        .clip(
-                            RoundedCornerShape(
-                                topStart = 28.dp, topEnd = 28.dp,
-                                bottomEnd = 40.dp, bottomStart = 28.dp
-                            )
-                        )
+                        .height(75.dp)
+                        .clip(RoundedCornerShape(30.dp))
                         .clickable(onClick = onChart),
                     color = Side
                 ) {
