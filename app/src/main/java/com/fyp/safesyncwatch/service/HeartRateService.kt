@@ -78,28 +78,19 @@ class HeartRateService : Service(),
         }
     }
 
+    // Dedicated thread/handler for sensor callbacks so callbacks can be delivered when main looper is throttled
+    private var sensorThread: android.os.HandlerThread? = null
+    private var sensorHandler: Handler? = null
+
     override fun onCreate() {
         super.onCreate()
         Log.d(TAG, "onCreate")
 
-        val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
-        wakeLock = pm.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "SafeSync:HR").apply { acquire() }
+        // Note: wakeLock and startForeground are managed in onStartCommand to be robust with startForegroundService
 
         registerReceiver(batteryReceiver, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
         heartRateSensor = sensorManager.getDefaultSensor(Sensor.TYPE_HEART_RATE)
-
-        // Start foreground
-        startForeground(1, createNotification())
-        Log.d(TAG, "startForeground done")
-
-        // Register sensor for fastest delivery
-        heartRateSensor?.let {
-            val ok = sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_FASTEST, 0)
-            Log.d(TAG, "registerListener=$ok sensor=${it.name}")
-        } ?: run {
-            Log.e(TAG, "No heart rate sensor!")
-        }
 
         // Ensure data-layer listeners are registered in the foreground service so callbacks survive screen-off
         try {
@@ -115,15 +106,78 @@ class HeartRateService : Service(),
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        Log.d(TAG, "onStartCommand")
+
+        // Ensure foreground / wake lock are active when service is started
+        try {
+            startForeground(1, createNotification())
+        } catch (e: Exception) {
+            Log.e(TAG, "startForeground failed in onStartCommand", e)
+        }
+
+        val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+        if (wakeLock == null || wakeLock?.isHeld == false) {
+            try {
+                wakeLock = pm.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "SafeSync:HR")
+                // Acquire with a safety timeout (e.g., 10 minutes) to avoid stuck locks
+                wakeLock?.acquire(10 * 60 * 1000L)
+                Log.d(TAG, "WakeLock acquired")
+            } catch (e: Exception) {
+                Log.e(TAG, "WakeLock acquire failed", e)
+            }
+        }
+
+        // Register sensor for fastest delivery on a dedicated handler thread
+        heartRateSensor?.let {
+            if (sensorThread == null) {
+                sensorThread = android.os.HandlerThread("HeartRateThread").apply { start() }
+                sensorHandler = Handler(sensorThread!!.looper)
+            }
+            try {
+                val ok = sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_FASTEST, 0, sensorHandler)
+                Log.d(TAG, "registerListener (threaded)=$ok sensor=${it.name}")
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed registering sensor listener on threaded handler", e)
+                // Fallback to main looper registration
+                try {
+                    val ok2 = sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_FASTEST)
+                    Log.d(TAG, "registerListener (main)=$ok2 sensor=${it.name}")
+                } catch (ex: Exception) {
+                    Log.e(TAG, "Fallback registerListener failed", ex)
+                }
+            }
+        } ?: run {
+            Log.e(TAG, "No heart rate sensor!")
+        }
+
         return START_STICKY
     }
 
     override fun onDestroy() {
         Log.d(TAG, "onDestroy")
-        unregisterReceiver(batteryReceiver)
-        sensorManager.unregisterListener(this)
+        try {
+            unregisterReceiver(batteryReceiver)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error unregistering batteryReceiver", e)
+        }
+        try {
+            sensorManager.unregisterListener(this)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error unregistering sensor", e)
+        }
+        try {
+            sensorHandler?.looper?.quitSafely()
+            sensorThread = null
+            sensorHandler = null
+        } catch (e: Exception) {
+            Log.e(TAG, "Error stopping sensor thread", e)
+        }
         handler.removeCallbacks(periodicSender)
-        wakeLock?.release()
+        try {
+            if (wakeLock?.isHeld == true) wakeLock?.release()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error releasing wakelock", e)
+        }
         wakeLock = null
 
         // Remove Wearable listeners
@@ -149,6 +203,24 @@ class HeartRateService : Service(),
 
             if (bpm > 0) {
                 lastMeasuredBpm = bpm
+                try {
+                    saveHeartRateEntry(now, bpm)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed saving heart rate entry", e)
+                }
+
+                // Broadcast an update so UI (if active) can update immediately
+                try {
+                    val update = Intent("com.fyp.safesyncwatch.HEART_RATE_UPDATED").apply {
+                        putExtra("bpm", bpm)
+                        putExtra("timestamp", now)
+                    }
+                    sendBroadcast(update)
+                    Log.d(TAG, "Broadcasted HEART_RATE_UPDATED bpm=$bpm ts=$now")
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed broadcasting HR update", e)
+                }
+
                 // Only send immediately if interval expired (otherwise rely on periodic sender)
                 if (now - lastSentTime >= sendIntervalMs) {
                     sendHeartRateToPhone(bpm)
@@ -198,19 +270,61 @@ class HeartRateService : Service(),
 
     private fun sendHeartRateToPhone(bpm: Int) {
         try {
+            val timestamp = System.currentTimeMillis()
+            // Primary: DataClient (existing)
             val dataClient = Wearable.getDataClient(applicationContext)
             val request = PutDataMapRequest.create("/heartRate").apply {
                 dataMap.putInt("bpm", bpm)
-                dataMap.putLong("timestamp", System.currentTimeMillis())
+                dataMap.putLong("timestamp", timestamp)
             }.asPutDataRequest().setUrgent()
 
             dataClient.putDataItem(request)
-                .addOnSuccessListener { Log.d(TAG, "Heart rate data sent: $bpm") }
+                .addOnSuccessListener { Log.d(TAG, "Heart rate data sent via DataApi: $bpm") }
                 .addOnFailureListener { e ->
-                    Log.e(TAG, "Failed sending heart rate", e)
+                    Log.e(TAG, "Failed sending heart rate via DataApi", e)
+                    // On failure, try message fallback
+                    trySendHeartRateViaMessage(bpm, timestamp)
                 }
+
+            // Also attempt message fallback in parallel for lower-latency delivery
+            trySendHeartRateViaMessage(bpm, timestamp)
         } catch (e: Exception) {
             Log.e(TAG, "Exception while sending heart rate", e)
+        }
+    }
+
+    private fun trySendHeartRateViaMessage(bpm: Int, timestamp: Long) {
+        try {
+            val messageClient = Wearable.getMessageClient(applicationContext)
+            // Discover connected nodes and send message to each
+            Wearable.getNodeClient(applicationContext).connectedNodes
+                .addOnSuccessListener { nodes ->
+                    val payload = "$bpm|$timestamp".toByteArray()
+                    for (node in nodes) {
+                        messageClient.sendMessage(node.id, "/heartRate", payload)
+                            .addOnSuccessListener { Log.d(TAG, "MessageApi sent to ${node.displayName}: $bpm") }
+                            .addOnFailureListener { e -> Log.e(TAG, "MessageApi failed to ${node.displayName}", e) }
+                    }
+                }.addOnFailureListener { e -> Log.e(TAG, "Failed to get connected nodes", e) }
+        } catch (e: Exception) {
+            Log.e(TAG, "Exception in trySendHeartRateViaMessage", e)
+        }
+    }
+
+    /**
+     * Persist a single heart rate entry to the same shared-preferences key used by MainActivity
+     * Format: history_v2 = "ts,bpm;ts,bpm;..."
+     */
+    private fun saveHeartRateEntry(timestamp: Long, bpm: Int) {
+        try {
+            val prefs = getSharedPreferences("heart_rate_prefs", Context.MODE_PRIVATE)
+            val existing = prefs.getString("history_v2", "") ?: ""
+            val entry = "${timestamp},${bpm}"
+            val updated = if (existing.isBlank()) entry else existing + ";" + entry
+            prefs.edit().putString("history_v2", updated).apply()
+            Log.d(TAG, "Saved HR entry to prefs: $entry")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error saving HR entry to prefs", e)
         }
     }
 
@@ -220,7 +334,7 @@ class HeartRateService : Service(),
             val channel = NotificationChannel(
                 channelId,
                 "Heart Rate Service",
-                NotificationManager.IMPORTANCE_DEFAULT
+                NotificationManager.IMPORTANCE_LOW
             )
             val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             manager.createNotificationChannel(channel)
@@ -229,6 +343,7 @@ class HeartRateService : Service(),
             .setContentTitle("Heart Rate Monitoring")
             .setContentText("Collecting heart rate in background")
             .setSmallIcon(R.drawable.app_logo)
+            .setOngoing(true)
             .build()
     }
 }

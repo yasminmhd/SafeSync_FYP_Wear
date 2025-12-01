@@ -154,10 +154,17 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                     permissionGranted = sensorPermissionGranted,
                     emergencyRequested = emergencyActivated,
                     onEmergencyHandled = {
-                        // Clear the activation and mark dismissal time so sensor won't re-trigger immediately
+                        // Send emergency to phone so phone app can proceed, then clear activation
+                        try {
+                            sendEmergencyToPhone(heartRateBpm)
+                        } catch (e: Exception) {
+                            Log.e(TAG, "sendEmergencyToPhone failed", e)
+                        }
+
                         emergencyActivated = false
                         emergencyDismissedAt = System.currentTimeMillis()
-                    }
+                    },
+                    onRequestBatteryExemption = { requestIgnoreBatteryOptimizations() }
                 )
 
                 SensorLifecycleEffect()
@@ -296,6 +303,19 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             // older devices: lint suppressed above because we intentionally use the older overload
             registerReceiver(hrUpdateReceiver, filter)
         }
+
+        // Load history saved by the background service while activity was paused / screen-off
+        try {
+            loadHeartRateHistory()
+            // Ensure we only show today's data on resume
+            pruneOldHeartRateHistory(startOfTodayMillis())
+            if (heartRateHistory.isNotEmpty()) {
+                heartRateBpm = heartRateHistory.last().bpm
+            }
+            Log.d(TAG, "onResume: Loaded ${heartRateHistory.size} history entries from prefs")
+        } catch (e: Exception) {
+            Log.e(TAG, "onResume: failed to load heart rate history", e)
+        }
     }
 
     override fun onPause() {
@@ -336,6 +356,48 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             }
         } else {
             Log.w("WEAR_SEND_DEBUG", "Activity is finishing/destroyed. CANNOT SEND BPM: $bpm")
+        }
+    }
+
+    // Send an emergency notification/payload to phone via DataClient + MessageClient
+    private fun sendEmergencyToPhone(bpm: Int) {
+        val timestamp = System.currentTimeMillis()
+        val safeBpm = if (bpm > 0) bpm else -1
+        Log.d(TAG, "Preparing to send EMERGENCY to phone. bpm=$safeBpm ts=$timestamp")
+
+        // 1) Put a DataItem so phone can observe even if message delivery fails
+        try {
+            val dataClient = Wearable.getDataClient(this)
+            val putRequest = PutDataMapRequest.create("/emergency").apply {
+                dataMap.putLong("timestamp", timestamp)
+                dataMap.putInt("bpm", safeBpm)
+                dataMap.putString("source", "watch")
+            }.asPutDataRequest().setUrgent()
+
+            dataClient.putDataItem(putRequest)
+                .addOnSuccessListener { Log.d(TAG, "Emergency DataItem sent") }
+                .addOnFailureListener { e -> Log.e(TAG, "Emergency DataItem failed", e) }
+        } catch (e: Exception) {
+            Log.e(TAG, "Exception while putting emergency DataItem", e)
+        }
+
+        // 2) Send a low-latency Message to connected nodes so phone can act immediately
+        try {
+            val payload = "{\"type\":\"emergency\",\"timestamp\":$timestamp,\"bpm\":$safeBpm}".toByteArray()
+            Wearable.getNodeClient(this).connectedNodes
+                .addOnSuccessListener { nodes ->
+                    if (nodes.isEmpty()) {
+                        Log.w(TAG, "No connected nodes to send emergency message to")
+                    }
+                    for (node in nodes) {
+                        Wearable.getMessageClient(this).sendMessage(node.id, "/emergency", payload)
+                            .addOnSuccessListener { Log.d(TAG, "Emergency message sent to ${node.displayName}") }
+                            .addOnFailureListener { e -> Log.e(TAG, "Failed sending emergency message to ${node.displayName}", e) }
+                    }
+                }
+                .addOnFailureListener { e -> Log.e(TAG, "Failed getting connected nodes for emergency", e) }
+        } catch (e: Exception) {
+            Log.e(TAG, "Exception while sending emergency message", e)
         }
     }
 
@@ -454,7 +516,6 @@ fun ema(values: List<Float>, alpha: Float = 0.3f): List<Float> {
     return out
 }
 
-// --- End of MainActivity ---
 @Composable
 fun HeartbeatScreen(bpm: Int, permissionGranted: Boolean) {
     Column(
