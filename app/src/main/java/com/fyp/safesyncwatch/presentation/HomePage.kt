@@ -1,5 +1,10 @@
 package com.fyp.safesyncwatch.presentation
 
+import android.content.Context
+import android.os.Build
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.runtime.Composable
@@ -46,6 +51,7 @@ import kotlinx.coroutines.delay
 import android.widget.Toast
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.scale
+import android.util.Log
 
 
 sealed class Screen(val route: String) {
@@ -222,6 +228,15 @@ fun SosHelpScreen(
     onCancel: () -> Unit = {}
 ) {
     val context = LocalContext.current
+    val vibrator = remember {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val manager = context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager
+            manager?.defaultVibrator
+        } else {
+            @Suppress("DEPRECATION")
+            context.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+        }
+    }
 
     // pulsing animation
     val transition = rememberInfiniteTransition()
@@ -258,6 +273,23 @@ fun SosHelpScreen(
             finished = true
             Toast.makeText(context, "Emergency ACTIVATED", Toast.LENGTH_LONG).show()
             try { onEmergencyConfirmed() } catch (_: Exception) {}
+        }
+    }
+
+    LaunchedEffect(secondsLeft, counting) {
+        if (counting) {
+            vibrator?.let { vib ->
+                try {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        vib.vibrate(VibrationEffect.createOneShot(120, VibrationEffect.DEFAULT_AMPLITUDE))
+                    } else {
+                        @Suppress("DEPRECATION")
+                        vib.vibrate(120)
+                    }
+                } catch (e: Exception) {
+                    Log.e("SOS_VIBRATE", "Failed to vibrate", e)
+                }
+            }
         }
     }
 

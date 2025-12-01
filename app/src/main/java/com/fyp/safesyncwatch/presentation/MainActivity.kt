@@ -154,7 +154,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                     permissionGranted = sensorPermissionGranted,
                     emergencyRequested = emergencyActivated,
                     onEmergencyHandled = {
-                        // Send emergency to phone so phone app can proceed, then clear activation
                         try {
                             sendEmergencyToPhone(heartRateBpm)
                         } catch (e: Exception) {
@@ -163,8 +162,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
                         emergencyActivated = false
                         emergencyDismissedAt = System.currentTimeMillis()
-                    },
-                    onRequestBatteryExemption = { requestIgnoreBatteryOptimizations() }
+                    }
                 )
 
                 SensorLifecycleEffect()
@@ -323,7 +321,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         Log.d(TAG, "Lifecycle.Event.ON_PAUSE from Activity")
         unregisterSensorListener()
         handler.removeCallbacks(bpmTimeoutRunnable)
-        // Unregister receiver
+        // Unregister receivers
         try { unregisterReceiver(hrUpdateReceiver) } catch (_: Exception) { }
     }
 
