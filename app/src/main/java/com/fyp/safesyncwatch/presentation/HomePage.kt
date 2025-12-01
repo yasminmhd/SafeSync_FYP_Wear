@@ -31,8 +31,21 @@ import com.fyp.safesyncwatch.R
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.runtime.CompositionLocalProvider
-
-
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.LaunchedEffect
+import kotlinx.coroutines.delay
+import android.widget.Toast
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.scale
 
 
 sealed class Screen(val route: String) {
@@ -46,9 +59,24 @@ sealed class Screen(val route: String) {
 fun WearRoot(
     heartRateList: List<HeartRateEntry>,
     latestBpm: Int,
-    permissionGranted: Boolean
+    permissionGranted: Boolean,
+    emergencyRequested: Boolean,
+    onEmergencyHandled: () -> Unit,
 ) {
     val nav = rememberNavController()
+
+    // When emergencyRequested becomes true navigate to SOS but DO NOT clear the request here.
+    LaunchedEffect(emergencyRequested) {
+        if (emergencyRequested) {
+            try {
+                // avoid repeated navigation if already on SOS
+                if (nav.currentBackStackEntry?.destination?.route != Screen.SOS.route) {
+                    nav.navigate(Screen.SOS.route)
+                }
+            } catch (_: Exception) { /* ignore navigation errors */ }
+            // do NOT call onEmergencyHandled() here — wait until SOS screen finishes (cancel or confirm)
+        }
+    }
 
     NavHost(navController = nav, startDestination = Screen.Home.route) {
         composable(Screen.Home.route) {
@@ -67,10 +95,15 @@ fun WearRoot(
         composable(Screen.Chart.route) {
             HeartRateChartScreen(heartRateList)
         }
-        composable(Screen.SOS.route) { SosHelpScreen() }
+        // pass the handler to SOS so it can clear the emergency flag when user cancels or when activated
+        composable(Screen.SOS.route) {
+            SosHelpScreen(
+                onEmergencyConfirmed = { onEmergencyHandled() },
+                onCancel = { onEmergencyHandled() }
+            )
+        }
     }
 }
-
 
 @Composable
 fun HomeHub(
@@ -184,46 +217,103 @@ fun HomeHub(
 }
 
 @Composable
-fun SosHelpScreen() {
+fun SosHelpScreen(
+    onEmergencyConfirmed: () -> Unit = {},
+    onCancel: () -> Unit = {}
+) {
     val context = LocalContext.current
-    val Brand = Color(0xFFF26060)
 
-    Scaffold(timeText = { TimeText() }) {
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(Color.White)
-        ) {
-            Column(
+    // pulsing animation
+    val transition = rememberInfiniteTransition()
+    val scale by transition.animateFloat(
+        initialValue = 1f,
+        targetValue = 1.18f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 900, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        )
+    )
+    val haloAlpha by transition.animateFloat(
+        initialValue = 0.28f,
+        targetValue = 0.06f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 900, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        )
+    )
+
+    var counting by remember { mutableStateOf(true) }
+    var secondsLeft by remember { mutableStateOf(10) }
+    var finished by remember { mutableStateOf(false) }
+
+    // countdown coroutine
+    LaunchedEffect(key1 = counting) {
+        if (!counting) return@LaunchedEffect
+        while (secondsLeft > 0 && counting) {
+            delay(1000L)
+            secondsLeft -= 1
+        }
+        if (secondsLeft <= 0 && counting) {
+            counting = false
+            finished = true
+            Toast.makeText(context, "Emergency ACTIVATED", Toast.LENGTH_LONG).show()
+            try { onEmergencyConfirmed() } catch (_: Exception) {}
+        }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.White),
+        contentAlignment = Alignment.Center
+    ) {
+        //halo effect
+        Box(contentAlignment = Alignment.Center) {
+            Box(
                 modifier = Modifier
-                    .fillMaxSize()
-                    .padding(12.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.SpaceEvenly
+                    .size(150.dp)
+                    .scale(scale)
+                    .alpha(haloAlpha)
+                    .clip(RoundedCornerShape(100.dp))
+                    .background(Color(0xFFFFCDD2))
+            )
+
+            //sos red button
+            Box(
+                modifier = Modifier
+                    .size(96.dp)
+                    .clip(RoundedCornerShape(100.dp))
+                    .background(Color(0xFFB00020))
+                    .clickable(enabled = counting) {
+                        // tapping cancels the pending emergency and notify host to suppress re-trigger
+                        counting = false
+                        finished = false
+                        try { onCancel() } catch (_: Exception) {}
+                    },
+                contentAlignment = Alignment.Center
             ) {
                 Text(
-                    text = "Need help?",
-                    style = MaterialTheme.typography.title2,
-                    color = Color(0xFF222222)
+                    text = if (counting) "SOS\n${secondsLeft}s" else if (finished) "Activated" else "Cancelled",
+                    textAlign = TextAlign.Center,
+                    style = androidx.wear.compose.material.MaterialTheme.typography.title2,
+                    color = Color.White
                 )
+            }
+        }
 
-                Button(
-                    onClick = {
-                        android.widget.Toast
-                            .makeText(context, "Help is on the way", android.widget.Toast.LENGTH_SHORT)
-                            .show()
-                    },
-                    modifier = Modifier.size(90.dp),
-                    colors = ButtonDefaults.primaryButtonColors(
-                        backgroundColor = Brand,
-                        contentColor = Color.White
-                    ),
-                    shape = androidx.compose.foundation.shape.CircleShape
-                ) {
-                    Text("SOS", style = MaterialTheme.typography.title1, color = Color.White)
-                }
+        Column(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(bottom = 26.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            if (counting) {
+                Text("Tap to cancel", style = androidx.wear.compose.material.MaterialTheme.typography.body2, color = Color.Gray)
+            } else if (finished) {
+                Text("Emergency mode", style = androidx.wear.compose.material.MaterialTheme.typography.body2, color = Color.Red)
+            } else {
+                Text("", style = androidx.wear.compose.material.MaterialTheme.typography.body2, color = Color.Gray)
             }
         }
     }
 }
-

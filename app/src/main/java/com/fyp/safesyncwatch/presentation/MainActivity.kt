@@ -58,6 +58,9 @@ import com.google.android.gms.wearable.Wearable
 import java.util.concurrent.TimeUnit
 import java.time.*
 import androidx.compose.material3.Surface
+import android.content.BroadcastReceiver
+import android.content.IntentFilter
+import android.annotation.SuppressLint
 
 fun startOfTodayMillis(): Long {
     val zone = ZoneId.systemDefault()
@@ -69,6 +72,26 @@ data class HeartRateEntry(
     val bpm: Int
 )
 class MainActivity : ComponentActivity(), SensorEventListener {
+    companion object {
+        const val ACTION_HR_UPDATED = "com.fyp.safesyncwatch.HEART_RATE_UPDATED"
+    }
+
+    private val hrUpdateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            val bpm = intent.getIntExtra("bpm", -1)
+            val ts = intent.getLongExtra("timestamp", System.currentTimeMillis())
+            if (bpm > 0) {
+                // Avoid duplicate entries with same timestamp
+                if (heartRateHistory.isEmpty() || heartRateHistory.last().timestamp != ts) {
+                    heartRateHistory.add(HeartRateEntry(ts, bpm))
+                    // keep UI state in sync
+                    heartRateBpm = bpm
+                    pruneOldHeartRateHistory(startOfTodayMillis())
+                    saveHeartRateHistory()
+                }
+            }
+        }
+    }
 
     private lateinit var sensorManager: SensorManager
     private var heartRateSensor: Sensor? = null
@@ -124,22 +147,20 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         setContent {
             SafeSyncWatchTheme {
                 if (!sensorPermissionGranted) { RequestHeartRatePermission() }
+
                 WearRoot(
                     heartRateList = heartRateHistory.toList(),
                     latestBpm = heartRateBpm,
-                    permissionGranted = sensorPermissionGranted
+                    permissionGranted = sensorPermissionGranted,
+                    emergencyRequested = emergencyActivated,
+                    onEmergencyHandled = {
+                        // Clear the activation and mark dismissal time so sensor won't re-trigger immediately
+                        emergencyActivated = false
+                        emergencyDismissedAt = System.currentTimeMillis()
+                    }
                 )
-                SensorLifecycleEffect()
 
-                // Emergency overlay
-                if (emergencyActivated) {
-                    EmergencyAlert(
-                        onCancel = {
-                            emergencyActivated = false
-                            emergencyDismissedAt = System.currentTimeMillis()
-                        }
-                    )
-                }
+                SensorLifecycleEffect()
             }
         }
     }
@@ -242,8 +263,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             val currentTime = System.currentTimeMillis()
             if (bpm > 0) {
                 heartRateBpm = bpm
-                // trigger emergency overlay if above threshold and not recently dismissed
-                if (bpm > 90 && !emergencyActivated && currentTime - emergencyDismissedAt > TimeUnit.SECONDS.toMillis(30)) {
+                if (bpm > 140 && !emergencyActivated && currentTime - emergencyDismissedAt > TimeUnit.SECONDS.toMillis(30)) {
                     emergencyActivated = true
                 }
                 if (heartRateHistory.isEmpty() || heartRateHistory.last().bpm != bpm) {
@@ -262,10 +282,20 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         }
     }
 
+    @SuppressLint("UnspecifiedRegisterReceiverFlag")
     override fun onResume() {
         super.onResume()
-        pruneOldHeartRateHistory(startOfTodayMillis())  // keep only today’s data
+        pruneOldHeartRateHistory(startOfTodayMillis())
         if (sensorPermissionGranted) initializeAndRegisterSensor()
+        // Register receiver to update graph in real-time
+        val filter = IntentFilter(ACTION_HR_UPDATED)
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+            // mark as not exported for unprotected local broadcasts
+            registerReceiver(hrUpdateReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            // older devices: lint suppressed above because we intentionally use the older overload
+            registerReceiver(hrUpdateReceiver, filter)
+        }
     }
 
     override fun onPause() {
@@ -273,6 +303,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         Log.d(TAG, "Lifecycle.Event.ON_PAUSE from Activity")
         unregisterSensorListener()
         handler.removeCallbacks(bpmTimeoutRunnable)
+        // Unregister receiver
+        try { unregisterReceiver(hrUpdateReceiver) } catch (_: Exception) { }
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {
@@ -314,32 +346,30 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         Log.d(TAG, "Saved history: $historyString")
     }
 
-    // Load heart rate history
     private fun loadHeartRateHistory() {
         val prefs = getSharedPreferences("heart_rate_prefs", Context.MODE_PRIVATE)
         val historyString = prefs.getString("history_v2", "") ?: ""
         heartRateHistory.clear()
         if (historyString.isNotEmpty()) {
             try {
-                val entries = historyString.split(";").mapNotNull {
-                    val parts = it.split(",")
-                    if (parts.size == 2) {
-                        HeartRateEntry(parts[0].toLong(), parts[1].toInt())
-                    } else {
-                        null
-                    }
+                val entries = historyString.split(";").mapNotNull { raw ->
+                    val parts = raw.trim().split(",")
+                    if (parts.size != 2) return@mapNotNull null
+                    val ts = parts[0].trim().toLongOrNull() ?: return@mapNotNull null
+                    val bpm = parts[1].trim().toIntOrNull() ?: return@mapNotNull null
+                    HeartRateEntry(ts, bpm)
                 }
                 heartRateHistory.addAll(entries)
-                // Prune old data on load as well
+                // Prune old data on load as well (keep last 48 hours as elsewhere)
                 pruneOldHeartRateHistory(System.currentTimeMillis() - TimeUnit.HOURS.toMillis(48))
-
             } catch (e: Exception) {
                 Log.e(TAG, "Error loading heart rate history", e)
             }
         }
         Log.d(TAG, "Loaded history items: ${heartRateHistory.size}")
     }
-    // Helper to remove data older than a certain point (e.g., 48 hours)
+
+    //remove data older than a certain point
     private fun pruneOldHeartRateHistory(thresholdTimestamp: Long) {
         val removed = heartRateHistory.removeAll { it.timestamp < thresholdTimestamp }
         if (removed) Log.d(TAG, "Pruned old heart rate entries. Kept: ${heartRateHistory.size}")
@@ -377,7 +407,7 @@ fun binHeartRate(
 ): List<BinnedPoint> {
     if (windowEndMs <= windowStartMs) return emptyList()
 
-    //Snap bin grid to the window start so x=0,6,12,18,24 line up
+    //Snap bin grid to the window start so x axis line up
     val bStart = windowStartMs
 
     val buckets = mutableMapOf<Long, MutableList<Int>>()
@@ -453,7 +483,7 @@ fun HeartbeatScreen(bpm: Int, permissionGranted: Boolean) {
             text = displayText,
             style = MaterialTheme.typography.title1,
             color = when {
-                bpm > 90 && permissionGranted -> Color.Red
+                bpm > 140 && permissionGranted -> Color(0xFFB00020)
                 bpm > 0 && permissionGranted -> Color.Black
                 else -> Color.LightGray
             }
@@ -492,16 +522,13 @@ fun HeartRateTimeChart(heartRateData: List<HeartRateEntry>) {
     val windowStart = now - TimeUnit.HOURS.toMillis(1) // last hour
     val durationMs = (windowEnd - windowStart).coerceAtLeast(1L)
 
-    val binMs = TimeUnit.MINUTES.toMillis(5) // 5-minute bins for last hour
-
-    val relevant = remember(heartRateData, now) {
-        heartRateData.filter { it.timestamp in windowStart..windowEnd }
-    }
-    val binned = remember(relevant, now) {
-        binHeartRate(relevant, windowStart, windowEnd, binMs)
+    val points = remember(heartRateData, now) {
+        heartRateData
+            .filter { it.timestamp in windowStart..windowEnd }
+            .sortedBy { it.timestamp }
     }
 
-    if (binned.isEmpty()) {
+    if (points.isEmpty()) {
         Box(
             modifier = Modifier
                 .height(chartHeightDp)
@@ -513,12 +540,15 @@ fun HeartRateTimeChart(heartRateData: List<HeartRateEntry>) {
         return
     }
 
-    val medianSeries = binned.map { it.median.toFloat() }
-    val smoothed = ema(medianSeries, alpha = 0.3f)
+    val bpmSeries = remember(points) { points.map { it.bpm.toFloat() } }
+    val smoothed = remember(bpmSeries) { ema(bpmSeries, alpha = 0.25f) }
 
-    val maxBpm = maxOf(binned.maxOf { it.max }, 40)
-    val minBpm = minOf(binned.minOf { it.min }, maxBpm - 20).coerceAtLeast(30)
+    // Determine visual bounds with some breathing room
+    val maxBpm = maxOf((points.maxOf { it.bpm }), 40)
+    val minBpm = minOf((points.minOf { it.bpm }), maxBpm - 20).coerceAtLeast(30)
     val bpmRange = (maxBpm - minBpm).coerceAtLeast(1).toFloat()
+
+    val maxGapMs = TimeUnit.MINUTES.toMillis(2) // split the line if gap > 2 minutes
 
     Box(
         modifier = Modifier
@@ -530,7 +560,7 @@ fun HeartRateTimeChart(heartRateData: List<HeartRateEntry>) {
             val bottomPad = 36.dp.toPx()
             val leftPad = 35.dp.toPx()
             val topPad = 50.dp.toPx()
-            val rightPad  = 14.dp.toPx()
+            val rightPad = 14.dp.toPx()
 
             val graphH = size.height - bottomPad - topPad
             val graphW = size.width - leftPad - rightPad
@@ -548,37 +578,58 @@ fun HeartRateTimeChart(heartRateData: List<HeartRateEntry>) {
             drawLine(Color.Gray, Offset(leftPad, topPad + graphH), Offset(leftPad + graphW, topPad + graphH), 2f)
             drawLine(Color.Gray, Offset(leftPad, topPad), Offset(leftPad, topPad + graphH), 2f)
 
-            // Min/Max band
-            val band = Path()
-            var haveStart = false
-            if (binned.isNotEmpty()) {
-                binned.forEach { p ->
-                    val x = xAt(p.tStart)
-                    val yU = yAt(p.max.toFloat())
-                    if (!haveStart) { band.moveTo(x, yU); haveStart = true } else { band.lineTo(x, yU) }
+            // Build contiguous segments (split on big gaps)
+            val segments = mutableListOf<MutableList<Int>>()
+            var current = mutableListOf<Int>()
+            for (i in points.indices) {
+                if (i == 0) {
+                    current.add(i)
+                } else {
+                    val gap = points[i].timestamp - points[i - 1].timestamp
+                    if (gap > maxGapMs) {
+                        segments.add(current)
+                        current = mutableListOf(i)
+                    } else {
+                        current.add(i)
+                    }
                 }
-                for (i in binned.lastIndex downTo 0) {
-                    val p = binned[i]
-                    val x = xAt(p.tStart)
-                    val yL = yAt(p.min.toFloat())
-                    band.lineTo(x, yL)
+            }
+            if (current.isNotEmpty()) segments.add(current)
+
+            // Draw fills and smoothed lines per segment (no point markers)
+            segments.forEach { seg ->
+                if (seg.size < 1) return@forEach
+
+                // Fill path (smoothed series)
+                val fillPath = Path()
+                val firstIdx = seg.first()
+                val firstX = xAt(points[firstIdx].timestamp)
+                val firstY = yAt(smoothed[firstIdx])
+                fillPath.moveTo(firstX, firstY)
+                for (idx in seg.drop(1)) {
+                    fillPath.lineTo(xAt(points[idx].timestamp), yAt(smoothed[idx]))
                 }
-                band.close()
-            }
-            drawPath(band, color = Color.Red.copy(alpha = 0.15f))
+                // close to baseline
+                val lastIdx = seg.last()
+                fillPath.lineTo(xAt(points[lastIdx].timestamp), topPad + graphH) // baseline at bottom
+                fillPath.lineTo(firstX, topPad + graphH)
+                fillPath.close()
+                drawPath(fillPath, color = Color.Red.copy(alpha = 0.12f))
 
-            // Smoothed median line
-            val line = Path()
-            var started = false
-            val maxGap = binMs * 2
-            binned.forEachIndexed { i, p ->
-                val x = xAt(p.tStart)
-                val y = yAt(smoothed[i])
-                val isGap = if (i == 0) false else (p.tStart - binned[i - 1].tStart) > maxGap
-                if (!started || isGap) { line.moveTo(x, y); started = true } else { line.lineTo(x, y) }
+                // Line path (smoothed) - rounded caps for smooth appearance
+                val linePath = Path()
+                linePath.moveTo(firstX, firstY)
+                for (idx in seg.drop(1)) {
+                    linePath.lineTo(xAt(points[idx].timestamp), yAt(smoothed[idx]))
+                }
+                drawPath(
+                    linePath,
+                    color = Color.Red,
+                    style = Stroke(width = 3f, cap = androidx.compose.ui.graphics.StrokeCap.Round)
+                )
             }
 
-            // Y ticks
+            // Y ticks and labels
             drawIntoCanvas { c ->
                 val paint = android.graphics.Paint().apply {
                     color = android.graphics.Color.BLACK
@@ -616,8 +667,6 @@ fun HeartRateTimeChart(heartRateData: List<HeartRateEntry>) {
                 val labelPaint = android.graphics.Paint(paint)
                 c.nativeCanvas.drawText("Minutes ago (last hour)", leftPad + graphW / 2f, topPad + graphH + 42f, labelPaint)
             }
-
-            drawPath(line, color = Color.Red, style = Stroke(width = 3f))
         }
     }
 }
